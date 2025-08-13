@@ -9,6 +9,8 @@ from torch.utils.data import DataLoader
 from utils.inc_net import CableNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
+from utils.forgetting_history import ForgettingHistory
+from models.reinforcement import ClippedPPO
 
 num_workers = 8
 
@@ -28,6 +30,7 @@ class Learner(BaseLearner):
         self.use_exemplars = args["use_old_data"]
         self.use_init_ptm = args["use_init_ptm"]
         self.use_diagonal = args["use_diagonal"]
+        self.max_adapters = self.args['max_adapter_num']
         
         self.recalc_sim = args["recalc_sim"]
         self.alpha = args["alpha"] # forward_reweight is divide by _cur_task
@@ -225,7 +228,8 @@ class Learner(BaseLearner):
                 # B_hat(old_cls2)
                 self._network.fc.weight.data[start_cls : end_cls, start_dim : end_dim] = B_hat.to(self._device)
         
-    def incremental_train(self, data_manager):
+    def incremental_train(self, data_manager, buffer_manager, task_id):
+        self.buffer_manager = buffer_manager
         self._cur_task += 1
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
         self._network.update_fc(self._total_classes)
@@ -242,15 +246,24 @@ class Learner(BaseLearner):
         self.train_dataset_for_protonet = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes),source="train", mode="test", )
         self.train_loader_for_protonet = DataLoader(self.train_dataset_for_protonet, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
 
+        self.ppo_agent = ClippedPPO(
+            adapters=self._network.backbone.cur_adapter,
+            loss_fn=F.cross_entropy,
+            batch=None,
+            state_dim=224,
+            action_dim=len(self._network.backbone.cur_adapter),
+            device=self._device
+        )
+
         if len(self._multiple_gpus) > 1:
             print('Multiple GPUs')
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
-        self._train(self.train_loader, self.test_loader)
+        self._train(self.train_loader, self.test_loader, task_id)
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
         self.replace_fc(self.train_loader_for_protonet)
 
-    def _train(self, train_loader, test_loader):
+    def _train(self, train_loader, test_loader, task_id):
         self._network.to(self._device)
         
         if self._cur_task == 0 or self.init_cls == self.inc:
@@ -267,7 +280,7 @@ class Learner(BaseLearner):
             optimizer = self.get_optimizer(lr=self.args["later_lr"])
             scheduler = self.get_scheduler(optimizer, self.args["later_epochs"])
 
-        self._init_train(train_loader, test_loader, optimizer, scheduler)
+        self._init_train(train_loader, test_loader, optimizer, scheduler, task_id)
     
     def get_optimizer(self, lr):
         if self.args['optimizer'] == 'sgd':
@@ -302,7 +315,7 @@ class Learner(BaseLearner):
 
         return scheduler
 
-    def _init_train(self, train_loader, test_loader, optimizer, scheduler):
+    def _init_train(self, train_loader, test_loader, optimizer, scheduler, task_id):
         if self.moni_adam:
             if self._cur_task > self.adapter_num - 1:
                 return
@@ -322,12 +335,45 @@ class Learner(BaseLearner):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
 
+                # Update buffer with current batch
+                if hasattr(self, "buffer_manager") and self.buffer_manager is not None:
+                    self.buffer_manager.add_batch(inputs.cpu(), targets.cpu(), task_id)
+                
+                if hasattr(self._network.backbone, "compute_fisher_trace_adapters"):
+                    batch_loader = [(inputs, None, targets)]
+                    fisher_traces = self._network.backbone.compute_fisher_trace_adapters(
+                        batch_loader,
+                        F.cross_entropy,
+                        device=self._device,
+                        num_batches=1
+                    )
+                    #logging.info(f"Fisher trace (task {task_id}, batch {i}): {fisher_traces}")
+                
+                state = inputs.mean(dim=0).cpu().numpy()  # Example state
+                self.ppo_agent.batch = (inputs, targets)
+                action = self.ppo_agent.select_action(state)
+                assigned_adapter = self.ppo_agent.assign_class_to_adapter(action)
+                # Optionally, process the batch with the assigned adapter here
+
+                # After processing, compute reward (e.g., negative loss)
+                output = self._network(inputs, test=False)
+                logits = output["logits"]
+                aux_targets = torch.where(
+                    targets - self._known_classes >= 0,
+                    targets - self._known_classes,
+                    -1,
+                ).type(torch.LongTensor).to(self._device)
+                loss = F.cross_entropy(logits, aux_targets)
+                reward = -loss.item()  # Example: negative loss as reward
+                self.ppo_agent.receive_reward(reward)
+                self.ppo_agent.update_policy()
+
                 aux_targets = targets.clone()
                 aux_targets = torch.where(
                     aux_targets - self._known_classes >= 0,
                     aux_targets - self._known_classes,
                     -1,
-                )
+                ).type(torch.LongTensor).to(self._device)
                 
                 output = self._network(inputs, test=False)
                 logits = output["logits"]
