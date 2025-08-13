@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 from timm.models.vision_transformer import PatchEmbed
 from timm.models.registry import register_model
+import torch.nn.functional as F
+import numpy as np
 
 import logging
 import os
@@ -51,14 +53,12 @@ class Adapter(nn.Module):
         self.up_proj = nn.Linear(self.down_size, self.n_embd)
 
         self.dropout = dropout
-        if init_option == "bert":
-            raise NotImplementedError
-        elif init_option == "lora":
-            with torch.no_grad():
-                nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
-                nn.init.zeros_(self.up_proj.weight)
-                nn.init.zeros_(self.down_proj.bias)
-                nn.init.zeros_(self.up_proj.bias)
+        # lora init
+        with torch.no_grad():
+            nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.up_proj.weight)
+            nn.init.zeros_(self.down_proj.bias)
+            nn.init.zeros_(self.up_proj.bias)
 
     def forward(self, x, add_residual=True, residual=None):
         residual = x if residual is None else residual
@@ -145,35 +145,46 @@ class Block(nn.Module):
         self.act = act_layer()
         self.mlp_drop = nn.Dropout(drop)
 
-    def forward(self, x, adapt=None):
+    def forward(self, x, adapters=None, gates=None):
         x = x + self.drop_path(self.attn(self.norm1(x)))
-        if adapt is not None:
-            adapt_x = adapt(x, add_residual=False)
-        else:
-            adapt_x = None
-            # print("use PTM backbone without adapter.")
-
         residual = x
         x = self.mlp_drop(self.act(self.fc1(self.norm2(x))))
         x = self.drop_path(self.mlp_drop(self.fc2(x)))
 
-        if adapt_x is not None:
+        # Gated adapter combination
+        if adapters is not None and gates is not None:
+            adapt_outputs = []
+            if adapters is not None and isinstance(adapters, nn.Module) and not isinstance(adapters, nn.ModuleList):
+                adapters = [adapters]
+            for i, adapt in enumerate(adapters):
+                adapt_out = adapt(x, add_residual=False)
+                adapt_outputs.append(adapt_out * gates[i])
+            adapt_x = sum(adapt_outputs)
             if self.config.ffn_adapt:
                 if self.config.ffn_option == 'sequential':
-                    x = adapt(x)
+                    x = x + adapt_x
+                elif self.config.ffn_option == 'parallel':
+                    x = x + adapt_x
+                else:
+                    raise ValueError(self.config.ffn_adapt)
+        elif adapters is not None:
+            # Default: use first adapter
+            adapt_x = adapters[0](x, add_residual=False)
+            if self.config.ffn_adapt:
+                if self.config.ffn_option == 'sequential':
+                    x = adapters[0](x)
                 elif self.config.ffn_option == 'parallel':
                     x = x + adapt_x
                 else:
                     raise ValueError(self.config.ffn_adapt)
 
         x = residual + x
-
         return x
 
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, global_pool=False, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
+    def __init__(self, global_pool=False, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=1024, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
                  act_layer=None, weight_init='', tuning_config=None):
@@ -246,6 +257,112 @@ class VisionTransformer(nn.Module):
         self.cur_adapter = nn.ModuleList()
         self.get_new_adapter()
 
+    def set_adapter_gates(self, fisher_traces, temperature=3.0):
+        # Set gating weights for adapters based on fisher traces.
+        fisher_tensor = torch.tensor(fisher_traces, dtype=torch.float32)
+        self.adapter_gates = F.softmax(fisher_tensor / temperature, dim=0).cpu().numpy()  # shape: [num_adapters]
+
+    def compute_forgetting_score_adapters(self, forgetting_traces, inputs, targets, loss_fn, lr=1e-3):
+        """
+        Computes the forgetting score for each adapter:
+        Forgetting_A = sum_i F_i^(A) * (theta_i - theta_i^t)^2
+        - forgetting_traces: list of tensors, one per adapter, shape matches adapter parameters
+        - inputs: input batch tensor
+        - targets: target batch tensor
+        - loss_fn: loss function to use
+        - lr: learning rate for simulated update
+        Returns: list of forgetting scores, one per adapter
+        """
+        self.eval()
+        inputs, targets = inputs.to(self._device), targets.to(self._device)
+        targets = targets.long()
+
+        # Get current parameters
+        theta_list = []
+        for adapter in self.cur_adapter:
+            theta_list.append([p.detach().clone() for p in adapter.parameters()])
+
+        # Simulate a gradient update (do not update actual model)
+        # 1. Forward pass
+        self.zero_grad()
+        outputs = self.forward_train(inputs)
+        loss = loss_fn(outputs, targets)
+        loss.backward()
+
+        # 2. Compute updated parameters for each adapter
+        theta_t_list = []
+        for adapter in self.cur_adapter:
+            updated_params = []
+            for p in adapter.parameters():
+                if p.grad is not None:
+                    updated_params.append(p.detach() - lr * p.grad.detach())
+                else:
+                    updated_params.append(p.detach().clone())
+            theta_t_list.append(updated_params)
+
+        # 3. Compute forgetting scores
+        scores = []
+        for F, theta, theta_t in zip(forgetting_traces, theta_list, theta_t_list):
+            score = 0.0
+            for f, p, p_t in zip(F, theta, theta_t):
+                score += torch.sum(f * (p - p_t) ** 2).item()
+            scores.append(score)
+        return self.zscore_normalize(scores)
+    
+    def zscore_normalize(self, scores):
+        scores = np.array(scores)
+        mean = scores.mean()
+        std = scores.std()
+        if std > 0:
+            return ((scores - mean) / std).tolist()
+        else:
+            return [0.0 for _ in scores]
+    
+    def sum_fisher_traces(self, traces):
+        """
+        Given a list of lists of tensors (traces) for each adapter,
+        returns a list of floats, one per adapter (sum of all elements in all parameter traces).
+        """
+        sum_traces = []
+        for adapter_traces in traces:
+            total = 0.0
+            for param_trace in adapter_traces:
+                total += param_trace.sum().item()
+            sum_traces.append(total)
+        return sum_traces
+
+    def compute_fisher_trace_adapters(self, dataloader, loss_fn, device=None, num_batches=10):
+        """
+        Approximates the Fisher Information trace for each adapter over a few batches.
+        Returns a list of lists of tensors, one list per adapter, each tensor matches a parameter's shape.
+        """
+        device = device or self._device
+        self.eval()
+        # Initialize traces: list of lists of tensors (one list per adapter, one tensor per parameter)
+        traces = [
+            [torch.zeros_like(param) for param in adapter.parameters()]
+            for adapter in self.cur_adapter
+        ]
+        for batch_idx, (inputs, _, targets) in enumerate(dataloader):
+            if batch_idx >= num_batches:
+                break
+            inputs, targets = inputs.to(device), targets.to(device)
+            targets = targets.long()
+            self.zero_grad()
+            outputs = self.forward_train(inputs)
+            loss = loss_fn(outputs, targets)
+            loss.backward()
+            for i, adapter in enumerate(self.cur_adapter):
+                for j, param in enumerate(adapter.parameters()):
+                    if param.grad is not None:
+                        traces[i][j] += (param.grad.detach() ** 2)
+        # Average over batches
+        for i in range(len(traces)):
+            for j in range(len(traces[i])):
+                traces[i][j] /= num_batches
+        self.set_adapter_gates([trace[0].sum().item() for trace in traces])  # Optionally gate by first param's sum
+        return traces
+
     def init_weights(self, mode=''):
         raise NotImplementedError()
 
@@ -277,7 +394,7 @@ class VisionTransformer(nn.Module):
         self.cur_adapter = nn.ModuleList()
         if config.ffn_adapt:
             for i in range(len(self.blocks)):
-                adapter = Adapter(self.config, dropout=0.1, bottleneck=config.ffn_num,
+                adapter = Adapter(self.config, dropout=0.1, bottleneck=config.ffn_num, d_model=self.embed_dim,
                                         init_option=config.ffn_adapter_init_option,
                                         adapter_scalar=config.ffn_adapter_scalar,
                                         adapter_layernorm_option=config.ffn_adapter_layernorm_option,
@@ -304,7 +421,11 @@ class VisionTransformer(nn.Module):
             if self.config.vpt_on:
                 eee = self.embeddings[idx].expand(B, -1, -1)
                 x = torch.cat([eee, x], dim=1)
-            x = blk(x, self.cur_adapter[idx])
+            # Gated adapter logic
+            if hasattr(self, "adapter_gates"):
+                x = blk(x, self.cur_adapter, self.adapter_gates)
+            else:
+                x = blk(x, self.cur_adapter)
             if self.config.vpt_on:
                 x = x[:, self.config.vpt_num:, :]
 
@@ -338,14 +459,14 @@ class VisionTransformer(nn.Module):
             x = copy.deepcopy(x_init)
             for j in range(len(self.blocks)):
                 adapt = self.adapter_list[i][j]
-                x = self.blocks[j](x, adapt)
+                x = self.blocks[j](x, adapt, self.adapter_gates)
             x = self.norm(x)
             features.append(x)
         
         x = copy.deepcopy(x_init)
         for i in range(len(self.blocks)):
             adapt = self.cur_adapter[i]
-            x = self.blocks[i](x, adapt)
+            x = self.blocks[i](x, adapt, self.adapter_gates)
         x = self.norm(x)
         features.append(x)
         
@@ -390,20 +511,19 @@ class VisionTransformer(nn.Module):
                 adapt = self.adapter_list[i][j]
             else:
                 adapt = self.cur_adapter[j]
-            x = self.blocks[j](x, adapt)
+            x = self.blocks[j](x, adapt, self.adapter_gates)
         x = self.norm(x)
         output = x[:, 0, :]
         
         return output
         
-
-def vit_large_patch14_clip_224_dfn2b_s39b(pretrained=False, **kwargs):
+def vit_base_patch16_224_cable(pretrained=False, **kwargs):
     
     model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 
     # checkpoint_model = torch.load('./pretrained_models/B_16-i21k-300ep-lr_0.001-aug_medium1-wd_0.1-do_0.0-sd_0.0.npz')
-    checkpoint_model=timm.create_model("vit_large_patch14_clip_224.dfn2b_s39b", pretrained=True, num_classes=0)
+    checkpoint_model=timm.create_model("vit_base_patch16_224", pretrained=True, num_classes=0)
     state_dict = checkpoint_model.state_dict()
     # modify the checkpoint state dict to match the model
     # first, split qkv weight into q, k, v
@@ -421,6 +541,50 @@ def vit_large_patch14_clip_224_dfn2b_s39b(pretrained=False, **kwargs):
             q_bias = qkv_bias[:768]
             k_bias = qkv_bias[768:768*2]
             v_bias = qkv_bias[768*2:]
+            state_dict[key.replace('qkv.bias', 'q_proj.bias')] = q_bias
+            state_dict[key.replace('qkv.bias', 'k_proj.bias')] = k_bias
+            state_dict[key.replace('qkv.bias', 'v_proj.bias')] = v_bias
+    # second, modify the mlp.fc.weight to match fc.weight
+    for key in list(state_dict.keys()):
+        if 'mlp.fc' in key:
+            fc_weight = state_dict.pop(key)
+            state_dict[key.replace('mlp.', '')] = fc_weight
+
+    msg = model.load_state_dict(state_dict, strict=False)
+    print(msg)
+
+    # freeze all but the adapter
+    for name, p in model.named_parameters():
+        if name in msg.missing_keys:
+            p.requires_grad = True
+        else:
+            p.requires_grad = False 
+    return model
+
+def vit_large_patch14_clip_224_dfn2b_s39b(pretrained=False, **kwargs):
+    
+    model = VisionTransformer(patch_size=14, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+
+    # checkpoint_model = torch.load('./pretrained_models/B_16-i21k-300ep-lr_0.001-aug_medium1-wd_0.1-do_0.0-sd_0.0.npz')
+    checkpoint_model=timm.create_model("vit_large_patch14_clip_224.dfn2b_s39b", pretrained=True, num_classes=0)
+    state_dict = checkpoint_model.state_dict()
+    # modify the checkpoint state dict to match the model
+    # first, split qkv weight into q, k, v
+    for key in list(state_dict.keys()):
+        if 'qkv.weight' in key:
+            qkv_weight = state_dict.pop(key)
+            q_weight = qkv_weight[:1024]
+            k_weight = qkv_weight[1024:1024*2]
+            v_weight = qkv_weight[1024*2:]
+            state_dict[key.replace('qkv.weight', 'q_proj.weight')] = q_weight
+            state_dict[key.replace('qkv.weight', 'k_proj.weight')] = k_weight
+            state_dict[key.replace('qkv.weight', 'v_proj.weight')] = v_weight
+        elif 'qkv.bias' in key:
+            qkv_bias = state_dict.pop(key)
+            q_bias = qkv_bias[:1024]
+            k_bias = qkv_bias[1024:1024*2]
+            v_bias = qkv_bias[1024*2:]
             state_dict[key.replace('qkv.bias', 'q_proj.bias')] = q_bias
             state_dict[key.replace('qkv.bias', 'k_proj.bias')] = k_bias
             state_dict[key.replace('qkv.bias', 'v_proj.bias')] = v_bias
