@@ -8,20 +8,25 @@ import timm
 def get_backbone(args, pretrained=False):
     name = args["backbone_type"].lower()
     
-    if name == "CLIP" or name == "vit_large_patch14_clip_224.dfn2b_s39b":
+    if name == "clip_zero":
         model = timm.create_model("vit_large_patch14_clip_224.dfn2b_s39b",pretrained=True, num_classes=0)
-        model.out_dim = 768
+        model.out_dim = 1024
         return model.eval()
-    elif name == "ResNet" or name == "resnet50d.ra4_e3600_r224_in1k":
+    elif name == "resnet_zero":
         model = timm.create_model("resnet50d.ra4_e3600_r224_in1k",pretrained=True, num_classes=0)
         model.out_dim = 768
-        return model.eval()    
+        return model.eval()
+    elif name == "pretrained_vit_b16_224" or name == "vit_base_patch16_224":
+        model = timm.create_model("vit_base_patch16_224", pretrained=pretrained, num_classes=0)
+        model.out_dim = 768
+        return model.eval()
 
     elif '_cable' in name:
         ffn_num = args["ffn_num"]
         if args["model_name"] == "cable" :
             from backbone import cable
             from easydict import EasyDict
+            tuning_config = None
             tuning_config = EasyDict(
                 # AdaptFormer
                 ffn_adapt=True,
@@ -36,12 +41,30 @@ def get_backbone(args, pretrained=False):
                 vpt_num=0,
                 _device = args["device"][0]
             )
-            if name == "vit_large_patch14_clip_224.dfn2b_s39b":
+            if "clip" in name:
                 model = cable.vit_large_patch14_clip_224_dfn2b_s39b(num_classes=0,
                     global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
-                model.out_dim=768
-            elif name == "resnet50d.ra4_e3600_r224_in1k":
+                model.out_dim=1024
+                tuning_config = EasyDict(
+                    # AdaptFormer
+                    ffn_adapt=True,
+                    ffn_option="parallel",
+                    ffn_adapter_layernorm_option="none",
+                    ffn_adapter_init_option="lora",
+                    ffn_adapter_scalar="0.1",
+                    ffn_num=ffn_num,
+                    d_model=1024,
+                    # VPT related
+                    vpt_on=False,
+                    vpt_num=0,
+                    _device = args["device"][0]
+                )
+            elif "resnet" in name:
                 model = cable.resnet50d_ra4_e3600_r224_in1k(num_classes=0,
+                    global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
+                model.out_dim=768
+            elif name == "vit_base_patch16_224_cable":
+                model = cable.vit_base_patch16_224_cable(num_classes=0,
                     global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
                 model.out_dim=768
             else:
@@ -141,7 +164,6 @@ class CableNet(BaseNet):
     # (proxy_fc = cls * dim)
     def update_fc(self, nb_classes):
         self._cur_task += 1
-        
         if self._cur_task == 0:
             self.proxy_fc = self.generate_fc(self.out_dim, self.init_cls).to(self._device)
         else:
@@ -166,16 +188,29 @@ class CableNet(BaseNet):
         return self.backbone(x)
 
     def forward(self, x, test=False):
-        if test == False:
-            x = self.backbone.forward(x, False)
+        # Only pass extra args for cable backbones
+        is_cable = hasattr(self.backbone, "forward") and (
+            "cable" in self.args["backbone_type"].lower()
+        )
+
+        if not test:
+            if is_cable:
+                x = self.backbone.forward(x, False)
+            else:
+                x = self.backbone(x)
             out = self.proxy_fc(x)
         else:
-            x = self.backbone.forward(x, True, use_init_ptm=self.use_init_ptm)
+            if is_cable:
+                x = self.backbone.forward(x, True, use_init_ptm=self.use_init_ptm)
+            else:
+                x = self.backbone(x)
             if self.args["moni_adam"] or (not self.args["use_reweight"]):
                 out = self.fc(x)
             else:
-                out = self.fc.forward_reweight(x, cur_task=self._cur_task, alpha=self.alpha, init_cls=self.init_cls, inc=self.inc, use_init_ptm=self.use_init_ptm, beta=self.beta)
-            
+                out = self.fc.forward_reweight(
+                    x, cur_task=self._cur_task, alpha=self.alpha, init_cls=self.init_cls,
+                    inc=self.inc, use_init_ptm=self.use_init_ptm, beta=self.beta
+                )
         out.update({"features": x})
         return out
 
