@@ -6,6 +6,7 @@ from utils import factory
 from utils.data_manager import DataManager
 from utils.toolkit import count_parameters
 import os
+from utils.buffer_manager import BufferManager
 
 
 def train(args):
@@ -56,6 +57,7 @@ def _train(args):
         args["increment"],
         args,
     )
+    buffer_manager = BufferManager(max_per_class=args["buffer_size"])
     
     args["nb_classes"] = data_manager.nb_classes # update args
     args["nb_tasks"] = data_manager.nb_tasks
@@ -67,7 +69,7 @@ def _train(args):
         logging.info(
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
-        model.incremental_train(data_manager)
+        model.incremental_train(data_manager, buffer_manager, task)
         cnn_accy, nme_accy = model.eval_task()
         model.after_task()
 

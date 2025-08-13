@@ -17,7 +17,7 @@ def load_json(setting_path):
 
 def setup_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='./exps/simplecil.json')
+    parser.add_argument('--config', type=str, default='./exps/cable_cifar10_clip.json')
     return parser
 
 if __name__ == '__main__':
